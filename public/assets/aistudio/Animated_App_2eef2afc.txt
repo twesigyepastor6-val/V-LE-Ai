@@ -1,0 +1,839 @@
+import ctypes
+import json
+import os
+import time
+import threading
+import tkinter as tk
+from tkinter import Canvas, font as tkfont
+
+# Make pixels real on Windows high-DPI screens (must run before Tk starts).
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
+from google import genai
+from google.genai import types
+
+# ============================================================
+# LOAD SETTINGS
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "nova_config.json")
+HISTORY_FILE = os.path.join(BASE_DIR, "nova_chat_history.json")
+
+# Every size here is a DESIGN value for a BASE_W x BASE_H screen, in pixels.
+# At runtime they are multiplied by a scale factor so the layout fits
+# whatever size the window (or device) really is.
+DEFAULTS = {
+    "model": "gemini-2.5-flash",
+    "assistant_name": "V∆LE Ai",
+    "screen_width": 720,
+    "screen_height": 1612,
+    "title_font_size": 30,
+    "small_font_size": 18,
+    "message_font_size": 24,
+    "input_font_size": 24,
+    "button_font_size": 28,
+    "header_height": 120,
+    "user_bubble_margin": 80,
+    "agent_bubble_margin": 40,
+    "bubble_padding": 20,
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+            user_cfg = json.load(file)
+    except FileNotFoundError:
+        raise SystemExit(
+            "Error: nova_config.json was not found.\n"
+            "Put it in the same folder as this Python file."
+        )
+    except json.JSONDecodeError:
+        raise SystemExit("Error: nova_config.json contains invalid JSON.")
+
+    cfg = dict(DEFAULTS)
+    cfg.update(user_cfg)
+    return cfg
+
+
+CONFIG = load_config()
+
+API_KEY = os.environ.get("GEMINI_API_KEY") or CONFIG.get("api_key", "")
+if not API_KEY or API_KEY.startswith("PASTE_"):
+    raise SystemExit(
+        "No API key found.\n"
+        "Set the GEMINI_API_KEY environment variable, or put your key in "
+        '"api_key" inside nova_config.json.'
+    )
+
+MODEL = CONFIG["model"]
+ASSISTANT_NAME = CONFIG["assistant_name"]
+
+BASE_W = int(CONFIG["screen_width"])
+BASE_H = int(CONFIG["screen_height"])
+
+# abs() so both 24 and -24 in the config mean "24 pixels"
+TITLE_PX = abs(int(CONFIG["title_font_size"]))
+SMALL_PX = abs(int(CONFIG["small_font_size"]))
+MESSAGE_PX = abs(int(CONFIG["message_font_size"]))
+INPUT_PX = abs(int(CONFIG["input_font_size"]))
+BUTTON_PX = abs(int(CONFIG["button_font_size"]))
+
+HEADER_HEIGHT = int(CONFIG["header_height"])
+USER_MARGIN = int(CONFIG["user_bubble_margin"])
+AGENT_MARGIN = int(CONFIG["agent_bubble_margin"])
+PAD = int(CONFIG["bubble_padding"])
+
+AVATAR = 44
+EDGE = 20
+GAP = 18
+TOP_START = 30
+
+# name: (design pixel size, weight)
+FONT_SPECS = {
+    "msg": (MESSAGE_PX, "normal"),
+    "title": (TITLE_PX, "bold"),
+    "small": (SMALL_PX, "normal"),
+    "small_bold": (SMALL_PX, "bold"),
+    "tiny": (max(8, SMALL_PX - 4), "normal"),
+    "tiny_bold": (max(8, SMALL_PX - 4), "bold"),
+    "input": (INPUT_PX, "normal"),
+    "button": (BUTTON_PX, "bold"),
+    "avatar": (20, "bold"),
+    "hdr_avatar": (24, "bold"),
+    "icon": (24, "bold"),
+}
+
+# ============================================================
+# COLORS
+# ============================================================
+
+BG = "#0b1220"
+PANEL = "#111c2e"
+INPUT_BG = "#1e293b"
+USER_BUBBLE = "#22c55e"
+AGENT_BUBBLE = "#1e293b"
+TEXT_LIGHT = "#e2e8f0"
+TEXT_MUTED = "#94a3b8"
+ACCENT = "#38bdf8"
+HEADER_TOP = "#1d4ed8"
+HEADER_BOTTOM = "#0ea5e9"
+TYPING_IDLE = "#475569"      # resting dot (dark-theme version of #C4C8CC)
+TYPING_ACTIVE = "#e2e8f0"    # swollen dot (dark-theme version of #63676B)
+
+# ============================================================
+# AI ASSISTANT
+# ============================================================
+
+SYSTEM_PROMPT = f"""You are {ASSISTANT_NAME}, a friendly, intelligent, and helpful AI assistant.
+
+Rules:
+- Be clear, concise, and useful.
+- Use short paragraphs and bullet points when helpful.
+- If you do not know something, say so honestly.
+- Never ask for passwords, PINs, card numbers, bank codes, or private identification numbers.
+- Do not pretend to access the user's phone, files, contacts, camera, or accounts.
+- Give practical, actionable answers.
+- For coding, provide complete working examples when useful.
+"""
+
+client = genai.Client(api_key=API_KEY)
+
+
+# ============================================================
+# CHAT APP
+# ============================================================
+
+class ValeAI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(ASSISTANT_NAME)
+        root.configure(bg=BG)
+
+        # ---- Pick a starting window that fits THIS screen -------------
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        h = screen_h - 80
+        w = round(h * BASE_W / BASE_H)          # keep the phone shape
+        if w > screen_w:
+            w = screen_w
+            h = round(w * BASE_H / BASE_W)
+        root.geometry(f"{w}x{h}+{(screen_w - w) // 2}+0")
+        root.minsize(360, 640)
+        root.resizable(True, True)
+
+        self.w, self.h = w, h
+        self.s = 1.0
+        self.last_size = (w, h)
+        self._resize_job = None
+
+        self.messages = []        # what gets saved to disk
+        self.display = []         # everything drawn (incl. welcome), for redraws
+        self.message_y = 0
+        self.busy = False
+        self.typing_y = None
+        self.typing_job = None
+        self.typing_dots = []
+        self.typing_centers = []
+        self.bubble_count = 0
+
+        # Live font objects: change their size and every widget using
+        # them updates automatically.
+        self.fonts = {
+            name: tkfont.Font(family="Arial", weight=weight, size=-size)
+            for name, (size, weight) in FONT_SPECS.items()
+        }
+        self.apply_scale()
+
+        self.chat = self.make_chat()
+
+        self.build_header()
+        self.build_quick_actions()
+        self.build_input_area()      # packed at bottom BEFORE the canvas
+        self.build_chat_canvas()
+
+        self.apply_widget_sizes()
+        self.draw_header()
+        self.clear_canvas()
+
+        self.add_bubble(
+            f"Hi! I’m {ASSISTANT_NAME}, your AI assistant.\n\n"
+            "Ask me anything, or tap a quick action above.",
+            "assistant",
+            record=False,
+        )
+
+        root.bind("<Configure>", self.on_resize)
+
+    # --------------------------------------------------------
+    # SCALING
+    # --------------------------------------------------------
+
+    def S(self, value):
+        """Convert a design pixel value to real pixels for this window."""
+        return max(1, round(value * self.s))
+
+    def apply_scale(self):
+        self.s = max(0.4, min(self.w / BASE_W, self.h / BASE_H))
+        for name, (size, _weight) in FONT_SPECS.items():
+            self.fonts[name].configure(size=-self.S(size))
+
+    def apply_widget_sizes(self):
+        """Re-apply scaled paddings to widgets that were already built."""
+        self.header.configure(height=self.S(HEADER_HEIGHT))
+        for button in self.quick_buttons:
+            button.configure(pady=self.S(10))
+        self.message_entry.pack_configure(ipady=self.S(14))
+        self.send_button.pack_configure(ipady=self.S(8))
+        self.input_frame.configure(pady=self.S(10), padx=self.S(10))
+
+    def on_resize(self, event):
+        if event.widget is not self.root:
+            return
+        if (event.width, event.height) == self.last_size:
+            return
+        self.last_size = (event.width, event.height)
+        self.w, self.h = event.width, event.height
+
+        # Debounce: wait until the user stops dragging the window edge.
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(150, self.relayout)
+
+    def relayout(self):
+        self._resize_job = None
+        self.apply_scale()
+        self.apply_widget_sizes()
+        self.draw_header()
+
+        was_typing = self.typing_y is not None
+        self.clear_canvas()
+        for role, text in list(self.display):
+            self.add_bubble(text, role, record=False, redraw=True)
+        if was_typing:
+            self.show_typing()
+
+    # --------------------------------------------------------
+    # GEMINI CHAT
+    # --------------------------------------------------------
+
+    def make_chat(self, history=None):
+        return client.chats.create(
+            model=MODEL,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.7,
+            ),
+            history=history or [],
+        )
+
+    # --------------------------------------------------------
+    # HEADER
+    # --------------------------------------------------------
+
+    def build_header(self):
+        self.header = Canvas(
+            self.root,
+            height=self.S(HEADER_HEIGHT),
+            highlightthickness=0,
+            bg=HEADER_TOP,
+        )
+        self.header.pack(fill="x")
+
+        self.menu_button = tk.Button(
+            self.header,
+            text="☰",
+            font=self.fonts["icon"],
+            bg=HEADER_TOP,
+            fg="white",
+            activebackground=HEADER_BOTTOM,
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            command=self.open_menu,
+        )
+
+    def draw_header(self):
+        """(Re)draw the gradient, avatar, title and menu button."""
+        header = self.header
+        header.delete("all")
+
+        hh = self.S(HEADER_HEIGHT)
+        header.configure(height=hh)
+        cy = hh // 2
+
+        for y in range(hh):
+            header.create_line(
+                0, y, self.w, y,
+                fill=self.mix_color(HEADER_TOP, HEADER_BOTTOM, y / hh),
+            )
+
+        r = self.S(26)
+        left = self.S(16)
+        header.create_oval(left, cy - r, left + 2 * r, cy + r,
+                           fill="white", outline="")
+        header.create_text(
+            left + r, cy,
+            text=ASSISTANT_NAME[:1].upper(),
+            fill=HEADER_TOP,
+            font=self.fonts["hdr_avatar"],
+        )
+
+        text_x = left + 2 * r + self.S(16)
+        header.create_text(
+            text_x, cy - self.S(16),
+            text=ASSISTANT_NAME,
+            fill="white",
+            font=self.fonts["title"],
+            anchor="w",
+        )
+        header.create_text(
+            text_x, cy + self.S(18),
+            text="● Online  •  Your personal AI assistant",
+            fill="#dbeafe",
+            font=self.fonts["small"],
+            anchor="w",
+        )
+
+        bw, bh = self.S(48), self.S(44)
+        self.menu_button.place(x=self.w - bw - self.S(16), y=cy - bh // 2,
+                               width=bw, height=bh)
+
+    @staticmethod
+    def mix_color(start, end, progress):
+        start = start.lstrip("#")
+        end = end.lstrip("#")
+        s = [int(start[i:i + 2], 16) for i in (0, 2, 4)]
+        e = [int(end[i:i + 2], 16) for i in (0, 2, 4)]
+        m = [int(s[i] + (e[i] - s[i]) * progress) for i in range(3)]
+        return "#{:02x}{:02x}{:02x}".format(*m)
+
+    def open_menu(self):
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=PANEL,
+            fg="white",
+            activebackground="#2563eb",
+            activeforeground="white",
+            font=self.fonts["small"],
+        )
+        menu.add_command(label="🆕 New Chat", command=self.new_chat)
+        menu.add_command(label="💾 Save Chat", command=self.save_chat)
+        menu.add_command(label="📂 Load Chat", command=self.load_chat)
+        menu.add_separator()
+        menu.add_command(label="❌ Exit", command=self.root.destroy)
+
+        menu.tk_popup(
+            self.root.winfo_rootx() + self.w - self.S(240),
+            self.root.winfo_rooty() + self.S(HEADER_HEIGHT) - self.S(20),
+        )
+
+    # --------------------------------------------------------
+    # QUICK ACTIONS
+    # --------------------------------------------------------
+
+    def build_quick_actions(self):
+        frame = tk.Frame(self.root, bg=BG)
+        frame.pack(fill="x", pady=(10, 6), padx=10)
+
+        prompts = {
+            "✍️ Email": "Help me write a professional email.",
+            "💻 Code": "Explain this code in simple terms:\n\n",
+            "📚 Study": "Explain this topic in simple terms:\n\n",
+            "💡 Ideas": "Give me 5 practical business ideas for Kampala, Uganda.",
+        }
+
+        self.quick_buttons = []
+        for label, prompt in prompts.items():
+            button = tk.Button(
+                frame,
+                text=label,
+                font=self.fonts["small_bold"],
+                bg=PANEL,
+                fg=ACCENT,
+                activebackground="#2563eb",
+                activeforeground="white",
+                relief="flat",
+                bd=0,
+                command=lambda p=prompt: self.use_quick_action(p),
+            )
+            button.pack(side="left", expand=True, fill="x", padx=3)
+            self.quick_buttons.append(button)
+
+    def use_quick_action(self, prompt):
+        self.message_entry.delete(0, "end")
+        # The entry is single-line, so show newlines as spaces.
+        self.message_entry.insert(0, prompt.replace("\n", " "))
+        self.message_entry.focus()
+
+    # --------------------------------------------------------
+    # CHAT AREA
+    # --------------------------------------------------------
+
+    def build_chat_canvas(self):
+        container = tk.Frame(self.root, bg=BG)
+        container.pack(fill="both", expand=True)
+
+        self.canvas = Canvas(container, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(container, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.canvas.bind_all("<MouseWheel>", self.on_wheel)
+        self.canvas.bind_all("<Button-4>", self.on_wheel)
+        self.canvas.bind_all("<Button-5>", self.on_wheel)
+
+    def on_wheel(self, event):
+        direction = -1 if (event.num == 4 or getattr(event, "delta", 0) > 0) else 1
+        self.canvas.yview_scroll(direction, "units")
+
+    def update_scroll_region(self):
+        self.canvas.update_idletasks()
+        height = max(self.message_y + 10, self.canvas.winfo_height())
+        self.canvas.configure(
+            scrollregion=(0, 0, self.canvas.winfo_width(), height)
+        )
+
+    def scroll_to_bottom(self):
+        self.update_scroll_region()
+        self.canvas.yview_moveto(1.0)
+
+    @staticmethod
+    def rounded_points(x1, y1, x2, y2, r):
+        return [
+            x1 + r, y1, x2 - r, y1, x2, y1,
+            x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2,
+            x1, y2 - r, x1, y1 + r, x1, y1,
+        ]
+
+    def add_bubble(self, message, role, record=True, tag=None, redraw=False):
+        """Draw one bubble. Height is measured from the real rendered text,
+        so nothing overflows at any scale."""
+        self.canvas.update_idletasks()
+
+        is_user = role == "user"
+        canvas_w = self.canvas.winfo_width()
+        if canvas_w < 100:
+            canvas_w = self.w - self.S(16)
+
+        pad = self.S(PAD)
+        edge = self.S(EDGE)
+        avatar = self.S(AVATAR)
+
+        self.bubble_count += 1
+        group = tag or f"msg{self.bubble_count}"
+
+        avatar_space = 0 if is_user else avatar + self.S(10)
+        margin = self.S(USER_MARGIN if is_user else AGENT_MARGIN)
+        max_bubble_w = canvas_w - margin - edge * 2 - avatar_space
+        wrap_w = max(60, max_bubble_w - pad * 2)
+
+        # 1. Draw text and measure it.
+        text_id = self.canvas.create_text(
+            0, 0,
+            text=message,
+            fill="white" if is_user else TEXT_LIGHT,
+            font=self.fonts["msg"],
+            width=wrap_w,
+            anchor="nw",
+            justify="left",
+            tags=group,
+        )
+        bx1, by1, bx2, by2 = self.canvas.bbox(text_id)
+        text_w, text_h = bx2 - bx1, by2 - by1
+
+        name_h = 0 if is_user else self.S(SMALL_PX + 10)
+        stamp_h = self.S(SMALL_PX + 4)
+        content_w = max(text_w, self.S(90 if is_user else 150))
+
+        bubble_w = content_w + pad * 2
+        bubble_h = pad + name_h + text_h + stamp_h + pad // 2
+
+        # 2. Position.
+        if is_user:
+            x2 = canvas_w - edge
+            x1 = x2 - bubble_w
+        else:
+            x1 = edge + avatar_space
+            x2 = x1 + bubble_w
+        y1 = self.message_y
+        y2 = y1 + bubble_h
+
+        # 3. Move text in, draw bubble underneath.
+        self.canvas.move(text_id, x1 + pad - bx1, y1 + pad + name_h - by1)
+
+        bubble = self.canvas.create_polygon(
+            self.rounded_points(x1, y1, x2, y2,
+                                min(self.S(20), bubble_h // 2)),
+            smooth=True,
+            fill=USER_BUBBLE if is_user else AGENT_BUBBLE,
+            outline="",
+            tags=group,
+        )
+        self.canvas.tag_lower(bubble, text_id)
+
+        if not is_user:
+            self.canvas.create_oval(
+                edge, y1, edge + avatar, y1 + avatar,
+                fill=ACCENT, outline="", tags=group,
+            )
+            self.canvas.create_text(
+                edge + avatar // 2, y1 + avatar // 2,
+                text=ASSISTANT_NAME[:1].upper(),
+                fill="white",
+                font=self.fonts["avatar"],
+                tags=group,
+            )
+            self.canvas.create_text(
+                x1 + pad, y1 + pad - self.S(4),
+                text=ASSISTANT_NAME.upper(),
+                fill=ACCENT,
+                font=self.fonts["tiny_bold"],
+                anchor="nw",
+                tags=group,
+            )
+
+        self.canvas.create_text(
+            x2 - pad, y2 - self.S(8),
+            text=time.strftime("%H:%M"),
+            fill="#dcfce7" if is_user else TEXT_MUTED,
+            font=self.fonts["tiny"],
+            anchor="se",
+            tags=group,
+        )
+
+        self.canvas.tag_bind(
+            group, "<Button-1>",
+            lambda event, text=message: self.copy_message(text),
+        )
+
+        if record:
+            self.messages.append({"role": role, "content": message})
+        if not redraw and tag != "typing":
+            self.display.append((role, message))
+
+        self.message_y = y2 + self.S(GAP)
+        self.scroll_to_bottom()
+        return group
+
+    # --------------------------------------------------------
+    # TOAST (notices that are NOT saved as chat messages)
+    # --------------------------------------------------------
+
+    def toast(self, text, ms=1600):
+        label = tk.Label(
+            self.root,
+            text=text,
+            bg=ACCENT,
+            fg=BG,
+            font=self.fonts["small_bold"],
+            padx=self.S(18),
+            pady=self.S(8),
+        )
+        label.place(relx=0.5, rely=0.86, anchor="center")
+        self.root.after(ms, label.destroy)
+
+    def copy_message(self, message):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(message)
+        self.toast("📋 Copied to clipboard")
+
+    # --------------------------------------------------------
+    # INPUT AREA
+    # --------------------------------------------------------
+
+    def build_input_area(self):
+        self.input_frame = tk.Frame(self.root, bg=PANEL)
+        self.input_frame.pack(fill="x", side="bottom")
+
+        self.message_entry = tk.Entry(
+            self.input_frame,
+            font=self.fonts["input"],
+            bg=INPUT_BG,
+            fg="white",
+            insertbackground="white",
+            relief="flat",
+        )
+        self.message_entry.pack(
+            side="left", fill="x", expand=True, ipady=14, padx=(0, 8)
+        )
+        self.message_entry.bind("<Return>", self.send_message)
+
+        self.send_button = tk.Button(
+            self.input_frame,
+            text="➤",
+            font=self.fonts["button"],
+            bg="#2563eb",
+            fg="white",
+            activebackground="#1d4ed8",
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            width=4,
+            command=self.send_message,
+        )
+        self.send_button.pack(side="right", ipady=8)
+
+    # --------------------------------------------------------
+    # SEND MESSAGE + LOADING ANIMATION
+    # --------------------------------------------------------
+
+    def show_typing(self):
+        """Animated three-dot bubble (from loading.json): each dot swells
+        and darkens in turn, 40-frame loop at 30 fps."""
+        self.canvas.update_idletasks()
+        self.stop_typing_animation()
+        self.typing_y = self.message_y
+
+        edge, avatar, pad = self.S(EDGE), self.S(AVATAR), self.S(PAD)
+        k = 0.2333 * self.s                 # Lottie units -> pixels
+        spacing, max_d = 128 * k, 72 * k
+        bubble_w = int(2 * spacing + max_d + pad * 2)
+        bubble_h = int(max_d + self.S(28))
+
+        x1 = edge + avatar + self.S(10)
+        y1 = self.message_y
+        x2, y2 = x1 + bubble_w, y1 + bubble_h
+
+        self.canvas.create_oval(edge, y1, edge + avatar, y1 + avatar,
+                                fill=ACCENT, outline="", tags="typing")
+        self.canvas.create_text(edge + avatar // 2, y1 + avatar // 2,
+                                text=ASSISTANT_NAME[:1].upper(), fill="white",
+                                font=self.fonts["avatar"], tags="typing")
+        bubble = self.canvas.create_polygon(
+            self.rounded_points(x1, y1, x2, y2,
+                                min(self.S(20), bubble_h // 2)),
+            smooth=True, fill=AGENT_BUBBLE, outline="", tags="typing")
+        self.canvas.tag_lower(bubble)
+
+        cy = y1 + bubble_h / 2
+        self.typing_centers = [x1 + pad + max_d / 2 + i * spacing
+                               for i in range(3)]
+        self.typing_cy = cy
+        self.typing_k = k
+        self.typing_dots = [
+            self.canvas.create_oval(0, 0, 0, 0, outline="", tags="typing")
+            for _ in range(3)
+        ]
+
+        self.message_y = y2 + self.S(GAP)
+        self.scroll_to_bottom()
+        self.animate_typing()
+
+    def animate_typing(self):
+        if self.typing_y is None or not self.typing_dots:
+            return
+        frame = (time.time() * 30) % 40
+
+        def smooth(t):                       # ease in-out
+            return t * t * (3 - 2 * t)
+
+        for i, dot in enumerate(self.typing_dots):
+            phase = (frame - 10 * i) % 40    # dot i starts at frame 10*i
+            if phase < 10:
+                e = smooth(phase / 10)
+            elif phase < 20:
+                e = 1 - smooth((phase - 10) / 10)
+            else:
+                e = 0
+            r = (48 + 24 * e) / 2 * self.typing_k
+            cx, cy = self.typing_centers[i], self.typing_cy
+            self.canvas.coords(dot, cx - r, cy - r, cx + r, cy + r)
+            self.canvas.itemconfig(
+                dot, fill=self.mix_color(TYPING_IDLE, TYPING_ACTIVE, e))
+
+        self.typing_job = self.root.after(33, self.animate_typing)
+
+    def stop_typing_animation(self):
+        if self.typing_job:
+            self.root.after_cancel(self.typing_job)
+            self.typing_job = None
+        self.typing_dots = []
+
+    def hide_typing(self):
+        self.stop_typing_animation()
+        self.canvas.delete("typing")
+        if self.typing_y is not None:
+            self.message_y = self.typing_y
+            self.typing_y = None
+
+    def send_message(self, event=None):
+        if self.busy:
+            return
+
+        user_message = self.message_entry.get().strip()
+        if not user_message:
+            return
+
+        self.busy = True
+        self.message_entry.delete(0, "end")
+
+        self.add_bubble(user_message, "user")
+        self.show_typing()
+
+        threading.Thread(
+            target=self.get_ai_reply, args=(user_message,), daemon=True
+        ).start()
+
+    def get_ai_reply(self, user_message):
+        try:
+            response = self.chat.send_message(user_message)
+            reply = response.text or "I didn't get a response. Please try again."
+        except Exception as error:
+            print("Gemini error:", error)
+            reply = (
+                "Sorry, I could not connect right now.\n\n"
+                "Please check your internet connection and API key."
+            )
+        self.root.after(0, self.finish_reply, reply)
+
+    def finish_reply(self, reply):
+        self.hide_typing()
+        self.add_bubble(reply, "assistant")
+        self.busy = False
+
+    # --------------------------------------------------------
+    # NEW / SAVE / LOAD CHAT
+    # --------------------------------------------------------
+
+    def clear_canvas(self):
+        """Wipe the drawing only (keeps message data, used by relayout)."""
+        self.stop_typing_animation()
+        self.canvas.delete("all")
+        self.message_y = self.S(TOP_START)
+        self.typing_y = None
+
+    def reset_chat(self):
+        self.clear_canvas()
+        self.messages = []
+        self.display = []
+
+    def new_chat(self):
+        if self.busy:
+            return
+        self.reset_chat()
+        self.chat = self.make_chat()
+        self.add_bubble(
+            "New chat started.\n\nHow can I help you today?",
+            "assistant",
+            record=False,
+        )
+
+    def save_chat(self):
+        if not self.messages:
+            self.toast("Nothing to save yet")
+            return
+
+        history = []
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+                    history = json.load(file)
+            except (json.JSONDecodeError, OSError):
+                history = []
+
+        history.append({
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "messages": self.messages,
+        })
+
+        with open(HISTORY_FILE, "w", encoding="utf-8") as file:
+            json.dump(history, file, indent=2, ensure_ascii=False)
+
+        self.toast("💾 Chat saved")
+
+    def load_chat(self):
+        if self.busy:
+            return
+        if not os.path.exists(HISTORY_FILE):
+            self.toast("No saved chats yet")
+            return
+
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+                history = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            self.toast("Could not read saved chats")
+            return
+
+        if not history:
+            self.toast("No saved chats yet")
+            return
+
+        saved = history[-1]["messages"]
+
+        # Rebuild Gemini's memory so the conversation can continue.
+        contents = []
+        for m in saved:
+            role = "user" if m["role"] == "user" else "model"
+            contents.append(
+                types.Content(role=role, parts=[types.Part(text=m["content"])])
+            )
+        while contents and contents[0].role != "user":
+            contents.pop(0)
+
+        self.reset_chat()
+        self.chat = self.make_chat(history=contents)
+
+        for m in saved:
+            self.add_bubble(m["content"], m["role"])
+
+        self.toast("📂 Loaded latest chat")
+
+
+# ============================================================
+# START APP
+# ============================================================
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ValeAI(root)
+    root.mainloop()

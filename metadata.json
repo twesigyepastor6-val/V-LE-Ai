@@ -1,0 +1,6 @@
+{
+  "name": "V∆LE Ai",
+  "description": "Personal AI assistant chat workspace with animated typing indicators, quick action prompts, and persistent session history.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
