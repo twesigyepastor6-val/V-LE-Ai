@@ -5,11 +5,13 @@ import {
   FileCode2,
   FolderOpen,
   Lightbulb,
+  FileText,
   Mail,
   Menu,
   MessageSquarePlus,
   Mic,
   MicOff,
+  Plus,
   Save,
   SendHorizonal,
   Square,
@@ -106,6 +108,9 @@ export default function App() {
   const [pythonLoading, setPythonLoading] = useState(false);
   const [pythonError, setPythonError] = useState<string | null>(null);
 
+  const [attachment, setAttachment] = useState<import("./types/chat").ChatAttachment | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const scrollContainerRef = useRef<HTMLElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -147,6 +152,35 @@ export default function App() {
       inputRef.current?.focus();
     }
   }, [busy, input, isListening, startListening, stopListening]);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.size > 10 * 1024 * 1024) {
+      showToast("File is too large (max 10MB)", 2500);
+      e.target.value = "";
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      setAttachment({
+        name: file.name,
+        type: file.type || "application/octet-stream",
+        size: file.size,
+        content: result,
+      });
+      showToast(`Attached ${file.name}`);
+      e.target.value = "";
+    };
+    reader.onerror = () => {
+      showToast("Could not read file");
+      e.target.value = "";
+    };
+    reader.readAsDataURL(file);
+  };
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -194,11 +228,21 @@ export default function App() {
         setPythonOpen(false);
       }
     };
+    const handleEditPrompt = (e: Event) => {
+      const customEvent = e as CustomEvent<{ id: string; content: string }>;
+      if (customEvent.detail?.content) {
+        setInput(customEvent.detail.content);
+        inputRef.current?.focus();
+      }
+    };
+
     document.addEventListener("mousedown", handleOutsideClick);
     document.addEventListener("keydown", handleEscape);
+    window.addEventListener("vale-edit-prompt", handleEditPrompt as EventListener);
     return () => {
       document.removeEventListener("mousedown", handleOutsideClick);
       document.removeEventListener("keydown", handleEscape);
+      window.removeEventListener("vale-edit-prompt", handleEditPrompt as EventListener);
     };
   }, []);
 
@@ -366,17 +410,19 @@ export default function App() {
       stopListening();
     }
     const trimmed = input.trim();
-    if (!trimmed) return;
+    if (!trimmed && !attachment) return;
 
     const historySnapshot = messages
       .filter((m) => !m.ephemeral)
       .map((m) => ({ role: m.role, content: m.content }));
 
+    const currentAttachment = attachment;
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
       role: "user",
-      content: trimmed,
+      content: trimmed || `[Attached document: ${currentAttachment?.name}]`,
       timestamp: getTimeLabel(),
+      attachment: currentAttachment ?? undefined,
     };
 
     const controller = new AbortController();
@@ -385,6 +431,7 @@ export default function App() {
 
     setBusy(true);
     setInput("");
+    setAttachment(null);
     setMessages((prev) => [...prev, userMsg]);
     setShowTyping(true);
 
@@ -436,6 +483,7 @@ export default function App() {
         body: JSON.stringify({
           message: trimmed,
           history: historySnapshot,
+          attachment: currentAttachment,
         }),
         signal: controller.signal,
       });
@@ -845,77 +893,124 @@ export default function App() {
 
         {/* Input Dock */}
         <footer className="shrink-0 bg-[#111c2e] border-t border-white/[0.07] px-3 sm:px-6 py-3">
-          <div className="max-w-3xl mx-auto flex items-end gap-2">
-            <textarea
-              ref={inputRef}
-              rows={1}
-              value={input}
-              onChange={(e) => {
-                if (isListening) {
-                  stopListening();
-                }
-                setInput(e.target.value);
-              }}
-              onKeyDown={handleKeyDown}
-              placeholder={
-                isListening
-                  ? "Listening… speak now"
-                  : `Message ${ASSISTANT_NAME}…`
-              }
-              aria-label={`Message ${ASSISTANT_NAME}`}
-              className={`flex-1 min-h-[48px] max-h-[144px] resize-none rounded-xl bg-[#1e293b] text-white placeholder-[#94a3b8] px-4 py-3 text-[15px] leading-snug border focus:outline-none focus:ring-2 focus:ring-[#38bdf8] ${
-                isListening
-                  ? "border-rose-500/70 placeholder-rose-300"
-                  : "border-white/[0.06]"
-              }`}
-            />
-
-            <button
-              type="button"
-              onClick={handleToggleVoice}
-              disabled={busy}
-              aria-label={isListening ? "Stop voice input" : "Start voice input"}
-              aria-pressed={isListening}
-              title={
-                !speechSupported
-                  ? "Voice input not supported in this browser"
-                  : isListening
-                    ? "Stop listening"
-                    : "Voice input"
-              }
-              className={`min-h-[48px] min-w-[48px] px-3 rounded-xl flex items-center justify-center border transition-colors shrink-0 cursor-pointer disabled:opacity-45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8] ${
-                isListening
-                  ? "bg-rose-600 hover:bg-rose-500 border-rose-400/50 text-white"
-                  : "bg-[#1e293b] hover:bg-[#273549] border-white/[0.06] text-[#38bdf8] hover:text-white"
-              }`}
-            >
-              {isListening ? (
-                <MicOff className="w-5 h-5" />
-              ) : (
-                <Mic className="w-5 h-5" />
-              )}
-            </button>
-
-            {busy ? (
-              <button
-                type="button"
-                onClick={stopGeneration}
-                aria-label="Stop generating"
-                className="min-h-[48px] min-w-[56px] px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center transition-colors shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8]"
-              >
-                <Square className="w-4 h-4 fill-current" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={sendMessage}
-                disabled={!input.trim()}
-                aria-label="Send message"
-                className="min-h-[48px] min-w-[56px] px-4 rounded-xl bg-[#2563eb] hover:bg-[#1d4ed8] disabled:opacity-45 disabled:hover:bg-[#2563eb] text-white flex items-center justify-center transition-colors shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8]"
-              >
-                <SendHorizonal className="w-5 h-5" />
-              </button>
+          <div className="max-w-3xl mx-auto">
+            {attachment && (
+              <div className="mb-2 px-3 py-2 rounded-xl bg-[#1e293b] border border-white/10 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-7 h-7 rounded-lg bg-[#2563eb]/20 text-[#38bdf8] flex items-center justify-center shrink-0">
+                    <FileText className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-white truncate">
+                      {attachment.name}
+                    </p>
+                    <p className="text-[10px] text-[#94a3b8] font-mono">
+                      {Math.round(attachment.size / 1024)} KB
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAttachment(null)}
+                  aria-label="Remove attachment"
+                  className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-lg text-[#94a3b8] hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             )}
+
+            <div className="flex items-end gap-2">
+              <div className="relative flex-1 flex items-center">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={handleFileChange}
+                  accept="image/*,application/pdf,text/*,.txt,.md,.csv,.json,.js,.ts,.py"
+                />
+
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={busy}
+                  aria-label="Add document or image"
+                  title="Add document or image"
+                  className="absolute left-2.5 min-h-[36px] min-w-[36px] p-2 rounded-lg bg-transparent hover:bg-white/10 text-[#38bdf8] hover:text-white flex items-center justify-center transition-colors cursor-pointer disabled:opacity-45"
+                >
+                  <Plus className="w-5 h-5" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleToggleVoice}
+                  disabled={busy}
+                  aria-label={isListening ? "Stop voice input" : "Start voice input"}
+                  aria-pressed={isListening}
+                  title={
+                    !speechSupported
+                      ? "Voice input not supported in this browser"
+                      : isListening
+                        ? "Stop listening"
+                        : "Voice input"
+                  }
+                  className={`absolute right-2.5 min-h-[36px] min-w-[36px] p-2 rounded-lg bg-transparent hover:bg-white/15 transition-colors flex items-center justify-center cursor-pointer disabled:opacity-45 ${
+                    isListening ? "text-rose-400 animate-pulse" : "text-[#38bdf8] hover:text-white"
+                  }`}
+                >
+                  {isListening ? (
+                    <MicOff className="w-5 h-5" />
+                  ) : (
+                    <Mic className="w-5 h-5" />
+                  )}
+                </button>
+
+                <textarea
+                  ref={inputRef}
+                  rows={1}
+                  value={input}
+                  onChange={(e) => {
+                    if (isListening) {
+                      stopListening();
+                    }
+                    setInput(e.target.value);
+                  }}
+                  onKeyDown={handleKeyDown}
+                  placeholder={
+                    isListening
+                      ? "Listening… speak now"
+                      : `Message ${ASSISTANT_NAME}…`
+                  }
+                  aria-label={`Message ${ASSISTANT_NAME}`}
+                  className={`w-full min-h-[48px] max-h-[144px] resize-none rounded-xl bg-[#1e293b] text-white placeholder-[#94a3b8] pl-12 pr-12 py-3 text-[15px] leading-snug border focus:outline-none focus:ring-0 ${
+                    isListening
+                      ? "border-rose-500/70 placeholder-rose-300"
+                      : "border-white/[0.06]"
+                  }`}
+                />
+              </div>
+
+              {busy ? (
+                <button
+                  type="button"
+                  onClick={stopGeneration}
+                  aria-label="Stop generating"
+                  className="min-h-[48px] min-w-[44px] px-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center transition-colors shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8]"
+                >
+                  <Square className="w-4 h-4 fill-current" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={sendMessage}
+                  disabled={!input.trim() && !attachment}
+                  aria-label="Send message"
+                  className="min-h-[48px] min-w-[56px] px-4 rounded-xl bg-[#2563eb] hover:bg-[#1d4ed8] disabled:opacity-45 disabled:hover:bg-[#2563eb] text-white flex items-center justify-center transition-colors shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8]"
+                >
+                  <SendHorizonal className="w-5 h-5" />
+                </button>
+              )}
+            </div>
           </div>
         </footer>
       </div>

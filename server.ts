@@ -147,6 +147,44 @@ async function writeHistoryFile(sessions: SavedSession[]): Promise<void> {
   );
 }
 
+async function generateSmartTitle(
+  ai: GoogleGenAI,
+  messages: StoredMessage[]
+): Promise<string> {
+  const userMessages = messages
+    .filter((m) => m && m.role === "user" && typeof m.content === "string")
+    .map((m) => m.content.trim())
+    .filter(Boolean);
+
+  if (userMessages.length === 0) return "Saved Conversation";
+
+  const firstFew = userMessages.slice(0, 3).join("\n- ");
+  const prompt = `Summarize the following chat conversation into a very short, catchy title (maximum 5 words, no quotes, no punctuation at end):\n- ${firstFew}`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-lite",
+      contents: prompt,
+      config: {
+        systemInstruction: "You are a concise title generator. Output only the short title.",
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.MINIMAL,
+        },
+      },
+    });
+
+    const titleText = (response.text ?? "").replace(/["'\n]/g, "").trim();
+    if (titleText && titleText.length <= 50) {
+      return titleText;
+    }
+  } catch {
+    // Fall back to heuristic title on any network or quota error
+  }
+
+  const fallbackLine = userMessages[0].replace(/\s+/g, " ").trim();
+  return fallbackLine.length > 36 ? `${fallbackLine.slice(0, 36)}…` : fallbackLine;
+}
+
 function deriveSessionTitle(messages: unknown): string {
   if (!Array.isArray(messages)) return "Saved Conversation";
   const firstUser = messages.find(
@@ -159,7 +197,7 @@ function deriveSessionTitle(messages: unknown): string {
 
   if (!firstUser) return "Saved Conversation";
   const singleLine = firstUser.content.replace(/\s+/g, " ").trim();
-  return singleLine.length > 44 ? `${singleLine.slice(0, 44)}…` : singleLine;
+  return singleLine.length > 36 ? `${singleLine.slice(0, 36)}…` : singleLine;
 }
 
 function formatNowTime(): string {
@@ -209,17 +247,23 @@ async function startServer() {
 
   // Streaming Gemini chat endpoint
   app.post("/api/chat", async (req, res) => {
-    const { message, history } = req.body ?? {};
+    const { message, history, attachment } = req.body ?? {};
 
-    if (typeof message !== "string" || !message.trim()) {
-      res.status(400).json({ error: "Message text is required." });
+    if (
+      (typeof message !== "string" || !message.trim()) &&
+      (!attachment || typeof attachment.content !== "string")
+    ) {
+      res.status(400).json({ error: "Message text or document attachment is required." });
       return;
     }
 
     const rawHistory = Array.isArray(history)
       ? history.slice(-MAX_HISTORY_TURNS)
       : [];
-    const contents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
+    const contents: Array<{
+      role: "user" | "model";
+      parts: Array<any>;
+    }> = [];
 
     for (const item of rawHistory) {
       if (
@@ -235,6 +279,51 @@ async function startServer() {
         });
       }
     }
+
+    // Build parts for the current message
+    const currentParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+    const messageText = typeof message === "string" ? message.trim() : "";
+    if (messageText) {
+      currentParts.push({ text: messageText });
+    }
+
+    if (
+      attachment &&
+      typeof attachment === "object" &&
+      typeof attachment.content === "string" &&
+      typeof attachment.type === "string"
+    ) {
+      // attachment.content may be "data:image/png;base64,iVBOR..." or raw base64
+      let mimeType = attachment.type || "application/octet-stream";
+      let base64Data = attachment.content;
+      const commaIdx = base64Data.indexOf(",");
+      if (commaIdx !== -1) {
+        const header = base64Data.slice(0, commaIdx);
+        const match = header.match(/data:([^;]+);base64/);
+        if (match?.[1]) {
+          mimeType = match[1];
+        }
+        base64Data = base64Data.slice(commaIdx + 1);
+      }
+
+      currentParts.push({
+        inlineData: {
+          mimeType,
+          data: base64Data,
+        },
+      });
+
+      if (!messageText) {
+        currentParts.unshift({
+          text: `Please analyze this attached document (${attachment.name || "file"}):`,
+        });
+      }
+    }
+
+    contents.push({
+      role: "user",
+      parts: currentParts,
+    });
 
     // Gemini multi-turn history must begin with a user turn.
     while (contents.length > 0 && contents[0].role !== "user") {
@@ -279,7 +368,7 @@ async function startServer() {
         let emittedAnyChunk = false;
 
         try {
-          const stream = await openModelStream(ai, model, contents, trimmedMessage);
+          const stream = await openModelStream(ai, model, contents as any, trimmedMessage);
 
           for await (const chunk of stream) {
             if (aborted) break;
@@ -360,13 +449,24 @@ async function startServer() {
         return;
       }
 
+      let ai: GoogleGenAI;
+      try {
+        ai = getAiClient();
+      } catch {
+        ai = null as unknown as GoogleGenAI;
+      }
+
+      const resolvedTitle =
+        typeof title === "string" && title.trim()
+          ? title.trim()
+          : ai
+            ? await generateSmartTitle(ai, sanitizedMessages)
+            : deriveSessionTitle(sanitizedMessages);
+
       const sessions = await readHistoryFile();
       const newSession: SavedSession = {
         id: `chat-${Date.now()}`,
-        title:
-          typeof title === "string" && title.trim()
-            ? title.trim()
-            : deriveSessionTitle(sanitizedMessages),
+        title: resolvedTitle,
         saved_at: formatNowTime(),
         messages: sanitizedMessages,
       };

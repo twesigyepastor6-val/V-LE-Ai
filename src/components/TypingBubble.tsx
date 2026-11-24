@@ -61,20 +61,12 @@ export function TypingBubble() {
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
   }, []);
-
   return (
     <div
       className="flex items-start gap-3"
       aria-label="V∆LE Ai is typing"
       role="status"
     >
-      <div
-        className="w-9 h-9 rounded-full bg-[#38bdf8] text-white font-display font-bold text-sm flex items-center justify-center shrink-0 select-none"
-        aria-hidden="true"
-      >
-        V
-      </div>
-
       <div className="bg-[#1e293b] border border-white/[0.06] rounded-2xl rounded-tl-md px-5 py-4 flex items-center gap-3 min-h-[48px]">
         {[0, 1, 2].map((index) => (
           <span

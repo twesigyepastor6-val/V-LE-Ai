@@ -1,3 +1,10 @@
+export interface ChatAttachment {
+  name: string;
+  type: string;
+  size: number;
+  content: string; // base64 or text content
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -5,6 +12,7 @@ export interface ChatMessage {
   timestamp: string;
   /** Mirrors Python's `record=False` for welcome/system greeting bubbles */
   ephemeral?: boolean;
+  attachment?: ChatAttachment;
 }
 
 export interface SavedSession {

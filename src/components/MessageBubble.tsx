@@ -3,7 +3,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 const REMARK_PLUGINS = [remarkGfm];
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, FileText, Pencil, Play, RotateCw, Share2, Square, ThumbsDown, ThumbsUp } from "lucide-react";
 import type { ChatMessage } from "../types/chat";
 
 interface MessageBubbleProps {
@@ -254,20 +254,69 @@ export const MessageBubble = memo(
     const isUser = message.role === "user";
     const components = useMemo(() => getMarkdownComponents(isUser), [isUser]);
 
+    const [copied, setCopied] = useState(false);
+    const [speaking, setSpeaking] = useState(false);
+    const [liked, setLiked] = useState<boolean | null>(null);
+
+    const handleCopyClick = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      onCopy(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    };
+
+    const handleShareClick = async (e: React.MouseEvent) => {
+      e.stopPropagation();
+      try {
+        if (navigator.share) {
+          await navigator.share({
+            title: "V∆LE Ai Response",
+            text: message.content,
+          });
+        } else {
+          await navigator.clipboard.writeText(message.content);
+          alert("Copied message to share");
+        }
+      } catch {
+        // Ignore share abort
+      }
+    };
+
+    const handleSpeakClick = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+        return;
+      }
+      const synth = window.speechSynthesis;
+      if (speaking) {
+        synth.cancel();
+        setSpeaking(false);
+        return;
+      }
+
+      synth.cancel();
+      const utterance = new SpeechSynthesisUtterance(message.content);
+      utterance.onend = () => setSpeaking(false);
+      utterance.onerror = () => setSpeaking(false);
+      setSpeaking(true);
+      synth.speak(utterance);
+    };
+
+    const handleRegenerateClick = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      // Dispatched via custom event or handled if callback provided
+      window.dispatchEvent(
+        new CustomEvent("vale-regenerate", { detail: { id: message.id } })
+      );
+    };
+
     return (
       <div
         className={`flex items-start gap-3 ${
           isUser ? "justify-end" : "justify-start"
         }`}
       >
-        {!isUser && (
-          <div
-            className="w-9 h-9 rounded-full bg-[#38bdf8] text-white font-display font-bold text-sm flex items-center justify-center shrink-0 select-none mt-0.5"
-            aria-hidden="true"
-          >
-            V
-          </div>
-        )}
+
 
         <div
           role="button"
@@ -280,18 +329,25 @@ export const MessageBubble = memo(
             }
           }}
           title="Click to copy message"
-          className={`group relative max-w-[85%] sm:max-w-[78%] rounded-2xl px-4 py-3 text-left transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8] ${
-            isUser
-              ? "bg-[#22c55e] hover:bg-[#1fb355] text-white rounded-tr-md"
-              : "bg-[#1e293b] hover:bg-[#243247] border border-white/[0.06] text-[#e2e8f0] rounded-tl-md"
+          className={`group relative max-w-[85%] sm:max-w-[78%] rounded-2xl px-4 py-3 text-left transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8] bg-[#1e293b] hover:bg-[#243247] border border-white/[0.06] text-[#e2e8f0] ${
+            isUser ? "rounded-tr-md" : "rounded-tl-md"
           }`}
         >
-          {!isUser && (
-            <div className="flex items-center justify-between gap-4 mb-1">
-              <span className="font-display text-[11px] font-bold tracking-wider text-[#38bdf8]">
-                V∆LE AI
-              </span>
-              <Copy className="w-3.5 h-3.5 text-[#94a3b8] opacity-0 group-hover:opacity-100 transition-opacity" />
+
+
+          {message.attachment && (
+            <div className="mb-2.5 rounded-xl bg-black/20 border border-white/10 p-2.5 flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center shrink-0">
+                <FileText className="w-4 h-4 text-[#38bdf8]" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-medium text-white truncate">
+                  {message.attachment.name}
+                </p>
+                <p className="text-[10px] text-[#94a3b8] font-mono">
+                  {Math.round(message.attachment.size / 1024)} KB
+                </p>
+              </div>
             </div>
           )}
 
@@ -304,12 +360,93 @@ export const MessageBubble = memo(
             </ReactMarkdown>
           </div>
 
-          <div
-            className={`mt-1.5 flex items-center justify-end gap-1.5 text-[11px] font-mono tabular-nums ${
-              isUser ? "text-[#dcfce7]" : "text-[#94a3b8]"
-            }`}
-          >
-            {isStreaming ? <span>Writing…</span> : <span>{message.timestamp}</span>}
+          <div className="mt-3 pt-2.5 border-t border-white/10 flex items-center justify-between gap-2">
+            <div
+              className={`text-[11px] font-mono tabular-nums ${
+                isUser ? "text-[#dcfce7]" : "text-[#94a3b8]"
+              }`}
+            >
+              {isStreaming ? <span>Writing…</span> : <span>{message.timestamp}</span>}
+            </div>
+
+            {!isUser && (
+              <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  onClick={handleCopyClick}
+                  title="Copy"
+                  className="p-1.5 rounded-lg text-[#94a3b8] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                >
+                  {copied ? <Check className="w-4 h-4 text-[#22c55e]" /> : <Copy className="w-4 h-4" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleShareClick}
+                  title="Share"
+                  className="p-1.5 rounded-lg text-[#94a3b8] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                >
+                  <Share2 className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSpeakClick}
+                  title={speaking ? "Stop speaking" : "Read aloud"}
+                  className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                    speaking ? "text-[#38bdf8] bg-white/10" : "text-[#94a3b8] hover:text-white hover:bg-white/10"
+                  }`}
+                >
+                  {speaking ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLiked(liked === true ? null : true)}
+                  title="Thumbs up"
+                  className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                    liked === true ? "text-[#22c55e] bg-white/10" : "text-[#94a3b8] hover:text-white hover:bg-white/10"
+                  }`}
+                >
+                  <ThumbsUp className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLiked(liked === false ? null : false)}
+                  title="Thumbs down"
+                  className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                    liked === false ? "text-rose-400 bg-white/10" : "text-[#94a3b8] hover:text-white hover:bg-white/10"
+                  }`}
+                >
+                  <ThumbsDown className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRegenerateClick}
+                  title="Regenerate"
+                  className="p-1.5 rounded-lg text-[#94a3b8] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                >
+                  <RotateCw className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {isUser && (
+              <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    window.dispatchEvent(
+                      new CustomEvent("vale-edit-prompt", {
+                        detail: { id: message.id, content: message.content },
+                      })
+                    );
+                  }}
+                  title="Edit prompt"
+                  className="p-1.5 rounded-lg text-[#94a3b8] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                >
+                  <Pencil className="w-4 h-4" />
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </div>
